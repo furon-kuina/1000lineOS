@@ -30,4 +30,9 @@ SECTIONS {
     /* Add 128KB to the current address */
     . += 128 * 1024;
     __stack_top = .;
+
+    . = ALIGN(4096);
+    __free_ram = .;
+    . += 64 * 1024 * 1024; /* 64MiBを動的に割り当てられるメモリ領域とする */
+    __free_ram_end = .;
 }
