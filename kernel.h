@@ -61,3 +61,26 @@ struct trap_frame {
     uint32_t __tmp = (value);                               \
     __asm__ __volatile__("csrw " #reg ", %0" ::"r"(__tmp)); \
   } while (0)
+
+#define PROCS_MAX 8
+#define PROC_UNUSED 0
+#define PROC_RUNNABLE 1
+
+struct process {
+  int pid;
+  int state;
+  vaddr_t sp;  // コンテキストスイッチが起こったときのスタックポインタを保存する
+  // プロセスごとにページテーブルを持つ
+  // プロセス間で共有しないことで同じ仮想アドレスで別の物理アドレスにアクセスできる
+  // さらにメモリ空間も分離できる
+  uint32_t *page_table;
+  uint8_t stack
+      [8192];  // コンテキストスイッチが起こったときに、再開に必要な情報をすべて保存する
+};
+
+#define SATP_SV32 (1u << 31)  // satpレジスタのビット
+#define PAGE_V (1 << 0)  // ページテーブルエントリの性質を設定するビット
+#define PAGE_R (1 << 1)  // 読み込み可能
+#define PAGE_W (1 << 2)  // 書き込み可能
+#define PAGE_X (1 << 3)  // 実行可能
+#define PAGE_U (1 << 4)  // ユーザーモードでアクセス可能

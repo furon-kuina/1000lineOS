@@ -34,8 +34,10 @@ __attribute__((naked))
 __attribute__((aligned(4))) // 関数の先頭アドレスを4バイト境界にアラインする
 void kernel_entry(void) {
   __asm__ __volatile__(
-      // 例外発生時のスタックポインタをsscratchレジスタに保存している
-      "csrw sscratch, sp\n"
+      // このOSではプロセスごとに独立したカーネルスタックを持つ
+      // 実行中のプロセスのカーネルスタックをsscratchから取り出す
+      // swap(sp, sscratch)
+      "csrrw sp, sscratch, sp\n"
       "addi sp, sp, -4 * 31\n"
       "sw ra,  4 * 0(sp)\n"
       "sw gp,  4 * 1(sp)\n"
@@ -70,6 +72,9 @@ void kernel_entry(void) {
 
       "csrr a0, sscratch\n"
       "sw a0, 4 * 30(sp)\n"
+
+      "addi a0, sp, 4 * 31\n"
+      "csrw sscratch, a0\n"
 
       "mv a0, sp\n"
       "call handle_trap\n"
@@ -136,13 +141,200 @@ paddr_t alloc_pages(uint32_t n) {
   return paddr;
 }
 
+struct process procs[PROCS_MAX];
+
+// スタックやスタックポインタのアドレスを保存する
+// そのあとロードしている
+// 引数に意味あるの？
+// 引数はa0レジスタ、a1レジスタに格納される
+__attribute__((naked)) void switch_context(uint32_t *prev_sp,
+                                           uint32_t *next_sp) {
+  __asm__ __volatile__(
+      "addi sp, sp, -13 * 4\n"
+      "sw ra,  0  * 4(sp)\n"
+      "sw s0,  1  * 4(sp)\n"
+      "sw s1,  2  * 4(sp)\n"
+      "sw s2,  3  * 4(sp)\n"
+      "sw s3,  4  * 4(sp)\n"
+      "sw s4,  5  * 4(sp)\n"
+      "sw s5,  6  * 4(sp)\n"
+      "sw s6,  7  * 4(sp)\n"
+      "sw s7,  8  * 4(sp)\n"
+      "sw s8,  9  * 4(sp)\n"
+      "sw s9,  10 * 4(sp)\n"
+      "sw s10, 11 * 4(sp)\n"
+      "sw s11, 12 * 4(sp)\n"
+      "sw sp, (a0)\n"
+      "lw sp, (a1)\n"
+      "lw ra,  0  * 4(sp)\n"
+      "lw s0,  1  * 4(sp)\n"
+      "lw s1,  2  * 4(sp)\n"
+      "lw s2,  3  * 4(sp)\n"
+      "lw s3,  4  * 4(sp)\n"
+      "lw s4,  5  * 4(sp)\n"
+      "lw s5,  6  * 4(sp)\n"
+      "lw s6,  7  * 4(sp)\n"
+      "lw s7,  8  * 4(sp)\n"
+      "lw s8,  9  * 4(sp)\n"
+      "lw s9,  10 * 4(sp)\n"
+      "lw s10, 11 * 4(sp)\n"
+      "lw s11, 12 * 4(sp)\n"
+      "addi sp, sp, 13 * 4\n"
+      "ret\n");
+}
+
+// CPUはメモリにアクセスするときに仮想アドレスを物理アドレスに変換する
+// CPUがやるというのが大事
+// map_pageの役割はプロセス作成時にそのプロセス用のページテーブルを作ること
+// vaddrをpaddrにマップするように設定する
+// 1段目のページテーブルは、プロセス作成時に作られる
+//
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+  if (!is_aligned(vaddr, PAGE_SIZE)) {
+    PANIC("unaligned varrr %x", vaddr);
+  }
+  if (!is_aligned(paddr, PAGE_SIZE)) {
+    PANIC("unaligned paddr %x", paddr);
+  }
+
+  // vpn1 = vaddrの上位10ビット
+  uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
+  if ((table1[vpn1] & PAGE_V) == 0) {
+    // vpn1に対応する2段目のページテーブルがまだない場合
+    uint32_t pt_paddr = alloc_pages(1);
+    // table1には20ビット分のアドレスが入る
+    // vpn1に対応する2段目のページテーブルのアドレス
+    // 下10ビットは0
+    table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+  }
+
+  // vpn0 = 仮想アドレスの上位11~20ビットを取り出したもの
+  uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+  // vaddrに対応するページテーブルエントリのアドレス
+  // このアドレスが空いていることは保証される？
+  uint32_t *table0 = (uint32_t *)((table1[vpn1] >> 10) * PAGE_SIZE);
+  // vpn0に対応するページテーブルエントリにpaddrの上位22ビットを入れる
+  table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
+
+extern char __kernel_base[];
+
+struct process *create_process(uint32_t pc) {
+  struct process *proc = NULL;
+  int i;
+  for (i = 0; i < PROCS_MAX; i++) {
+    if (procs[i].state == PROC_UNUSED) {
+      proc = &procs[i];
+      break;
+    }
+  }
+  if (!proc) {
+    PANIC("no free process slots");
+  }
+
+  uint32_t *sp = (uint32_t *)&proc->stack[sizeof(proc->stack)];
+  *--sp = 0;             // s11
+  *--sp = 0;             // s10
+  *--sp = 0;             // s9
+  *--sp = 0;             // s8
+  *--sp = 0;             // s7
+  *--sp = 0;             // s6
+  *--sp = 0;             // s5
+  *--sp = 0;             // s4
+  *--sp = 0;             // s3
+  *--sp = 0;             // s2
+  *--sp = 0;             // s1
+  *--sp = 0;             // s0
+  *--sp = (uint32_t)pc;  // ra
+
+  uint32_t *page_table = (uint32_t *)alloc_pages(1);
+
+  for (paddr_t paddr = (paddr_t)__kernel_base; paddr < (paddr_t)__free_ram_end;
+       paddr += PAGE_SIZE) {
+    map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+  }
+
+  proc->pid = i + 1;
+  proc->state = PROC_RUNNABLE;
+  proc->sp = (uint32_t)sp;
+  proc->page_table = page_table;
+  return proc;
+}
+
+struct process *current_proc;
+struct process *idle_proc;
+
+void yield(void) {
+  struct process *next = idle_proc;
+  for (int i = 0; i < PROCS_MAX; i++) {
+    struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
+    if (proc->state == PROC_RUNNABLE && proc->pid > 0) {
+      next = proc;
+      break;
+    }
+  }
+  if (next == current_proc) {
+    return;
+  }
+
+  // satpレジスタに1段目のページテーブルのアドレスを設定することで
+  // ページテーブルを切り替えられる
+
+  // sfence命令は、out-of-order実行を防ぐ
+  __asm__ __volatile__(
+      "sfence.vma\n"
+      "csrw satp, %[satp]\n"
+      "sfence.vma\n"
+      "csrw sscratch, %[sscratch]\n"
+      :
+      : [satp] "r"(SATP_SV32 | ((uint32_t)next->page_table / PAGE_SIZE)),
+        [sscratch] "r"((uint32_t)&next->stack[sizeof(next->stack)]));
+
+  struct process *prev = current_proc;
+  current_proc = next;
+  switch_context(&prev->sp, &next->sp);
+}
+
+struct process *proc_a;
+struct process *proc_b;
+
+void proc_a_entry(void) {
+  printf("starting process A\n");
+  while (1) {
+    // putchar('A');
+    yield();
+
+    for (int i = 0; i < 30000000; i++) {
+      __asm__ __volatile__("nop");
+    }
+  }
+}
+
+void proc_b_entry(void) {
+  printf("starting process B\n");
+  while (1) {
+    // putchar('B');
+    yield();
+
+    for (int i = 0; i < 30000000; i++) {
+      __asm__ __volatile__("nop");
+    }
+  }
+}
+
 void kernel_main(void) {
   memset(__bss, 0, (size_t)__bss_end - (size_t)__bss);
-  paddr_t paddr0 = alloc_pages(2);
-  paddr_t paddr1 = alloc_pages(1);
-  printf("alloc_pages test: paddr0=%x\n", paddr0);
-  printf("alloc_pages test: paddr1=%x\n", paddr1);
-  PANIC("booted!");
+
+  WRITE_CSR(stvec, (uint32_t)kernel_entry);
+
+  idle_proc = create_process((uint32_t)NULL);
+  idle_proc->pid = -1;
+  current_proc = idle_proc;
+
+  proc_a = create_process((uint32_t)proc_a_entry);
+  proc_b = create_process((uint32_t)proc_b_entry);
+  proc_a_entry();
+  PANIC("unreachable");
 }
 
 __attribute__((section(".text.boot"))) __attribute__((naked)) void boot(void) {
